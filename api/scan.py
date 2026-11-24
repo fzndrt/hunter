@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 import os
 import sys
 import time
@@ -24,6 +25,9 @@ from bot.telegram_notifier import (
     format_entry_alert,
     format_exit_alert,
 )
+
+logger = logging.getLogger("corridor-desk.scan")
+SCAN_HARD_TIMEOUT_SEC = 22.0
 
 
 def is_authorized_cron_request(
@@ -56,7 +60,7 @@ async def execute_scan_and_exit_guard(cfg: BotConfig) -> dict:
         follow_redirects=False,
     ) as client:
         # 1. Jalankan siklus pemindaian 8-feed (Fresh + Pre-ATH Sleeper Revival)
-        results, feed_notes = await run_scan_cycle(client, cfg, max_stage2=12)
+        results, feed_notes = await run_scan_cycle(client, cfg, max_stage2=10)
         ready = [r for r in results if r.verdict == "ENTRY_READY"]
         watch = [r for r in results if r.verdict == "WATCH_PULLBACK"]
 
@@ -122,29 +126,81 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _handle(self) -> None:
-        cfg = BotConfig.from_env()
+    def _send_empty(self, status: int) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _check_auth(self, cfg: BotConfig) -> tuple[int, dict] | None:
         if not cfg.cron_secret:
-            self._send_json(
+            return (
                 503,
                 {
                     "ok": False,
-                    "error": "CRON_SECRET belum diatur di Vercel Environment Variables.",
+                    "error_code": "MISSING_CRON_SECRET",
+                    "error": "CRON_SECRET belum diatur di Vercel Environment Variables. Tambahkan lalu klik Redeploy.",
                 },
             )
-            return
 
         auth_header = self.headers.get("Authorization", "")
         cron_header = self.headers.get("X-Cron-Secret", "")
         if not is_authorized_cron_request(cfg.cron_secret, auth_header, cron_header):
-            self._send_json(401, {"ok": False, "error": "Unauthorized"})
+            return (
+                401,
+                {
+                    "ok": False,
+                    "error_code": "INVALID_CRON_SECRET",
+                    "error": "Header Authorization: Bearer <CRON_SECRET> atau X-Cron-Secret tidak cocok.",
+                },
+            )
+        return None
+
+    def _handle(self) -> None:
+        cfg = BotConfig.from_env()
+        auth_err = self._check_auth(cfg)
+        if auth_err is not None:
+            status, payload = auth_err
+            self._send_json(status, payload)
             return
 
         try:
-            summary = asyncio.run(execute_scan_and_exit_guard(cfg))
+            summary = asyncio.run(
+                asyncio.wait_for(
+                    execute_scan_and_exit_guard(cfg),
+                    timeout=SCAN_HARD_TIMEOUT_SEC,
+                )
+            )
             self._send_json(200, summary)
-        except Exception:
-            self._send_json(500, {"ok": False, "error": "Gagal menjalankan siklus scan."})
+        except asyncio.TimeoutError:
+            logger.warning("Siklus /api/scan melebihi timeout %.1fs", SCAN_HARD_TIMEOUT_SEC)
+            self._send_json(
+                504,
+                {
+                    "ok": False,
+                    "error_code": "SCAN_TIMEOUT",
+                    "error": "Siklus scan melebihi batas waktu 22 detik (upstream DEX/RugCheck lambat).",
+                },
+            )
+        except Exception as exc:
+            logger.exception("Error /api/scan")
+            self._send_json(
+                500,
+                {
+                    "ok": False,
+                    "error_code": "SCAN_ERROR",
+                    "error_type": type(exc).__name__,
+                    "error": "Gagal menjalankan siklus scan. Cek Vercel Function Logs untuk detail.",
+                },
+            )
+
+    def do_HEAD(self) -> None:
+        cfg = BotConfig.from_env()
+        auth_err = self._check_auth(cfg)
+        if auth_err is not None:
+            self._send_empty(auth_err[0])
+            return
+        self._send_empty(200)
 
     def do_GET(self) -> None:
         self._handle()
