@@ -16,6 +16,12 @@ from bot.storage import validate_upstash_rest_url
 
 
 class handler(BaseHTTPRequestHandler):
+    def do_HEAD(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
     def do_GET(self) -> None:
         cfg = BotConfig.from_env()
         has_upstash = bool(
